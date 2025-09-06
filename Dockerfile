@@ -1,0 +1,15 @@
+# Use the official Python 3.13-slim image as the base image
+FROM python:3.13-slim
+
+# Set the working directory inside the container
+WORKDIR /app
+
+# Install uv using pip, as it's the recommended way to get the latest version.
+RUN pip install uv
+
+# Copy the rest of the application's source code into the container
+COPY . .
+
+# Command to run the application using uv
+# This command is executed when the container starts
+CMD ["uv", "run", "main.py", "run", "all"]

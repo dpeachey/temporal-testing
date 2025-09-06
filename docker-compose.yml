@@ -1,0 +1,13 @@
+services:
+  deployer:
+    build: .
+    container_name: deployer
+    ports:
+      - 8001:8001
+    networks:
+      - infrahub_default
+
+networks:
+  infrahub_default:
+    external: true
+    name: infrahub_default

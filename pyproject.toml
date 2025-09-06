@@ -1,0 +1,13 @@
+[project]
+name = "temporal-testing"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.116.1",
+    "infrahub-sdk>=1.14.0",
+    "pygnmi>=0.8.15",
+    "temporal-boost>=2.0.1",
+    "uvicorn>=0.35.0",
+]
