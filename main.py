@@ -1,6 +1,7 @@
 import logging
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import timedelta
+from time import sleep
 from typing import Any
 
 import yaml
@@ -23,29 +24,30 @@ app = BoostApp(
 
 client = InfrahubClientSync(config=Config(address="http://infrahub-server-1:8000"))
 
-all_artifacts_query = """query AllDevicesArtifactsQuery {
-InfraDevice {
+all_artifacts_query = """
+query ArtifactQuery {
+CoreArtifact {
     edges {
-    node {
-        name {
-        value
+        node {
+        checksum {
+            value
         }
-        artifacts {
-        edges {
+        storage_id {
+            value
+        }
+        object {
             node {
-            storage_id {
-                value
-                updated_at
-            }
+            display_label
             }
         }
         }
     }
     }
 }
-}"""
+"""
 
-artifact_query = """query DeviceArtifactQuery($device: String!) {
+artifact_query = """
+query DeviceArtifactQuery($device: String!) {
 InfraDevice(name__value: $device) {
     edges {
     node {
@@ -55,9 +57,11 @@ InfraDevice(name__value: $device) {
         artifacts {
         edges {
             node {
+            checksum {
+                value
+            }
             storage_id {
                 value
-                updated_at
             }
             }
         }
@@ -65,39 +69,74 @@ InfraDevice(name__value: $device) {
     }
     }
 }
-}"""
+}
+"""
+
+
+# @activity.defn(name="get_updated_devices")
+# async def get_updated_devices(occured_at: str) -> list[str]:
+#     data = client.execute_graphql(query=all_artifacts_query)
+#     devices: list[str] = []
+#     occured_at_format_code = "%Y-%m-%d %H:%M:%S.%f%z"
+#     updated_at_format_code = "%Y-%m-%dT%H:%M:%S.%f%z"
+
+#     for device in data["InfraDevice"]["edges"]:
+#         for artifact in device["node"]["artifacts"]["edges"]:
+#             updated_at = artifact["node"]["storage_id"]["updated_at"]
+#             updated_at_dt = datetime.strptime(updated_at, updated_at_format_code)
+#             occured_at_dt = datetime.strptime(occured_at, occured_at_format_code)
+
+#             if updated_at_dt >= occured_at_dt:
+#                 devices.append(device["node"]["name"]["value"])
+
+#     return devices
 
 
 @activity.defn(name="get_updated_devices")
-async def get_updated_devices(occured_at: str) -> list[str]:
-    data = client.execute_graphql(query=all_artifacts_query)
-    devices: list[str] = []
-    occured_at_format_code = "%Y-%m-%d %H:%M:%S.%f%z"
-    updated_at_format_code = "%Y-%m-%dT%H:%M:%S.%f%z"
+async def get_updated_devices(branch: str) -> dict[str, str]:
+    data_from_branch = client.execute_graphql(query=all_artifacts_query, branch_name=branch)
+    data_from_main = client.execute_graphql(query=all_artifacts_query)
+    devices: dict[str, str] = []
 
-    for device in data["InfraDevice"]["edges"]:
-        for artifact in device["node"]["artifacts"]["edges"]:
-            updated_at = artifact["node"]["storage_id"]["updated_at"]
-            updated_at_dt = datetime.strptime(updated_at, updated_at_format_code)
-            occured_at_dt = datetime.strptime(occured_at, occured_at_format_code)
-
-            if updated_at_dt >= occured_at_dt:
-                devices.append(device["node"]["name"]["value"])
+    branch_artifacts: set[tuple[str, str, str]] = {
+        (
+            artifact["node"]["object"]["node"]["display_label"],
+            artifact["node"]["checksum"]["value"],
+            artifact["node"]["storage_id"]["value"],
+        )
+        for artifact in data_from_branch["CoreArtifact"]["edges"]
+    }
+    main_artifacts: set[tuple[str, str, str]] = {
+        (
+            artifact["node"]["object"]["node"]["display_label"],
+            artifact["node"]["checksum"]["value"],
+            artifact["node"]["storage_id"]["value"],
+        )
+        for artifact in data_from_main["CoreArtifact"]["edges"]
+    }
+    devices = {artifact[0]: artifact[1] for artifact in branch_artifacts.difference(main_artifacts)}
 
     return devices
 
 
 @activity.defn(name="get_artifact")
-async def get_artifact(device: str) -> dict[str, Any]:
-    data = client.execute_graphql(query=artifact_query, variables={"device": device})
-    artifact_id = data["InfraDevice"]["edges"][0]["node"]["artifacts"]["edges"][0]["node"]["storage_id"]["value"]
-    response = client.object_store.get(identifier=artifact_id)
+async def get_artifact(device: str, expected_checksum: str) -> dict[str, Any]:
+    artifact_rendered = False
+
+    while not artifact_rendered:
+        sleep(3)
+        data = client.execute_graphql(query=artifact_query, variables={"device": device})
+        checksum = data["InfraDevice"]["edges"][0]["node"]["artifacts"]["edges"][0]["node"]["checksum"]["value"]
+        storage_id = data["InfraDevice"]["edges"][0]["node"]["artifacts"]["edges"][0]["node"]["storage_id"]["value"]
+        artifact_rendered = True if checksum == expected_checksum else False
+
+    response = client.object_store.get(identifier=storage_id)
     artifact = yaml.load(response, Loader=yaml.SafeLoader)
     return artifact
 
 
 @activity.defn(name="configure_device")
-async def configure_device(device: str, artifact: dict[str, Any]) -> dict[str, list[str]]:
+async def configure_device(device: str, artifact: dict[str, Any]) -> dict[str, dict[str, list[str]]]:
     """
     Main function to connect to a gNMI-enabled device and send a Set RPC with an update action.
     """
@@ -143,7 +182,7 @@ async def configure_device(device: str, artifact: dict[str, Any]) -> dict[str, l
         print(f"\nAn error occurred: {e}")
         raise Exception(f"An error occurred: {e}")
 
-    return diffs
+    return {device: diffs}
 
 
 @workflow.defn(sandboxed=False, name="DeploymentWorkflow")
@@ -154,16 +193,17 @@ class Deployment:
 
         devices = await workflow.execute_activity(
             activity=get_updated_devices,
-            arg=payload["occured_at"],
-            schedule_to_close_timeout=timedelta(seconds=10),
+            arg=payload["branch"],
+            schedule_to_close_timeout=timedelta(seconds=300),
+            start_to_close_timeout=timedelta(seconds=60),
         )
 
         child_promises = []
-        for device in devices:
+        for device, expected_checksum in devices.items():
             child_promises.append(
                 workflow.execute_child_workflow(
                     workflow=ConfigureDevice.run,
-                    arg=device,
+                    args=[device, expected_checksum],
                     id=f"{device}-proposed-change-{payload['data']['proposed_change_id']}",
                     task_queue="default_queue",
                 )
@@ -176,16 +216,18 @@ class Deployment:
 @workflow.defn(sandboxed=False, name="ConfigureDeviceWorkflow")
 class ConfigureDevice:
     @workflow.run
-    async def run(self, device: str) -> dict[str, Any]:
+    async def run(self, device: str, expected_checksum: str) -> dict[str, Any]:
         artifact = await workflow.execute_activity(
             activity=get_artifact,
-            arg=device,
-            schedule_to_close_timeout=timedelta(seconds=10),
+            args=[device, expected_checksum],
+            schedule_to_close_timeout=timedelta(seconds=300),
+            start_to_close_timeout=timedelta(seconds=60),
         )
         diffs = await workflow.execute_activity(
             activity=configure_device,
             args=[device, artifact],
-            schedule_to_close_timeout=timedelta(seconds=10),
+            schedule_to_close_timeout=timedelta(seconds=300),
+            start_to_close_timeout=timedelta(seconds=60),
         )
         return diffs
 
@@ -195,6 +237,8 @@ app.add_worker(
     "default_queue",
     workflows=[Deployment, ConfigureDevice],
     activities=[get_updated_devices, get_artifact, configure_device],
+    max_concurrent_activities=20,
+    max_concurrent_workflow_tasks=20,
 )
 
 
@@ -206,7 +250,7 @@ async def run_deployment_workflow(payload: dict[str, Any]) -> WorkflowHandle:
     return await client.start_workflow(
         workflow=Deployment.run,
         arg=payload,
-        start_delay=timedelta(seconds=10),
+        # start_delay=timedelta(seconds=10),
         id=workflow_id,
         task_queue="default_queue",
     )
