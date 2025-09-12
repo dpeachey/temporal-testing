@@ -14,6 +14,7 @@ from temporalio.client import Client, WorkflowHandle
 
 logging.basicConfig(level=logging.INFO)
 TEMPORAL_SERVER = "temporal:7233"
+DEPLOYED_STORAGE_IDS = set()
 
 app = BoostApp(
     name="BoostApp example",
@@ -72,28 +73,24 @@ InfraDevice(name__value: $device) {
 }
 """
 
-
-# @activity.defn(name="get_updated_devices")
-# async def get_updated_devices(occured_at: str) -> list[str]:
-#     data = client.execute_graphql(query=all_artifacts_query)
-#     devices: list[str] = []
-#     occured_at_format_code = "%Y-%m-%d %H:%M:%S.%f%z"
-#     updated_at_format_code = "%Y-%m-%dT%H:%M:%S.%f%z"
-
-#     for device in data["InfraDevice"]["edges"]:
-#         for artifact in device["node"]["artifacts"]["edges"]:
-#             updated_at = artifact["node"]["storage_id"]["updated_at"]
-#             updated_at_dt = datetime.strptime(updated_at, updated_at_format_code)
-#             occured_at_dt = datetime.strptime(occured_at, occured_at_format_code)
-
-#             if updated_at_dt >= occured_at_dt:
-#                 devices.append(device["node"]["name"]["value"])
-
-#     return devices
+device_query = """
+query DeviceQuery($device_id: [ID]) {
+InfraDevice(ids: $device_id) {
+    edges {
+    node {
+        id
+        name {
+        value
+        }
+    }
+    }
+}
+}
+"""
 
 
 @activity.defn(name="get_updated_devices")
-async def get_updated_devices(branch: str) -> dict[str, str]:
+async def get_updated_devices(branch: str) -> dict[str, tuple[str, str]]:
     data_from_branch = client.execute_graphql(query=all_artifacts_query, branch_name=branch)
     data_from_main = client.execute_graphql(query=all_artifacts_query)
     devices: dict[str, str] = []
@@ -114,7 +111,7 @@ async def get_updated_devices(branch: str) -> dict[str, str]:
         )
         for artifact in data_from_main["CoreArtifact"]["edges"]
     }
-    devices = {artifact[0]: artifact[1] for artifact in branch_artifacts.difference(main_artifacts)}
+    devices = {artifact[0]: (artifact[1], artifact[2]) for artifact in branch_artifacts.difference(main_artifacts)}
 
     return devices
 
@@ -133,6 +130,12 @@ async def get_artifact(device: str, expected_checksum: str) -> dict[str, Any]:
     response = client.object_store.get(identifier=storage_id)
     artifact = yaml.load(response, Loader=yaml.SafeLoader)
     return artifact
+
+
+@activity.defn(name="get_device")
+async def get_device(device_id: str) -> str:
+    data = client.execute_graphql(query=device_query, variables={"device_id": device_id})
+    return data["InfraDevice"]["edges"][0]["node"]["name"]["value"]
 
 
 @activity.defn(name="configure_device")
@@ -185,8 +188,8 @@ async def configure_device(device: str, artifact: dict[str, Any]) -> dict[str, d
     return {device: diffs}
 
 
-@workflow.defn(sandboxed=False, name="DeploymentWorkflow")
-class Deployment:
+@workflow.defn(sandboxed=False, name="ProposedChangeWorkflow")
+class ProposedChangeWorkflow:
     @workflow.run
     async def run(self, payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
         from temporalio.workflow import asyncio
@@ -199,7 +202,8 @@ class Deployment:
         )
 
         child_promises = []
-        for device, expected_checksum in devices.items():
+        for device, (expected_checksum, storage_id) in devices.items():
+            DEPLOYED_STORAGE_IDS.add(storage_id)
             child_promises.append(
                 workflow.execute_child_workflow(
                     workflow=ConfigureDevice.run,
@@ -210,6 +214,28 @@ class Deployment:
             )
         results = await asyncio.gather(*child_promises)
         workflow.logger.info("Child workflows finished. Results: %s", results)
+        return results
+
+
+@workflow.defn(sandboxed=False, name="PortkeyWorkflow")
+class PortkeyWorkflow:
+    @workflow.run
+    async def run(self, payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        device = await workflow.execute_activity(
+            activity=get_device,
+            arg=payload["data"]["target_id"],
+            schedule_to_close_timeout=timedelta(seconds=300),
+            start_to_close_timeout=timedelta(seconds=60),
+        )
+
+        results = await workflow.execute_child_workflow(
+            workflow=ConfigureDevice.run,
+            args=[device, payload["data"]["checksum"]],
+            id=f"{device}-portkey-{payload['data']['target_id']}",
+            task_queue="default_queue",
+        )
+
+        workflow.logger.info("Child workflow finished. Results: %s", results)
         return results
 
 
@@ -235,20 +261,34 @@ class ConfigureDevice:
 app.add_worker(
     "default_worker",
     "default_queue",
-    workflows=[Deployment, ConfigureDevice],
-    activities=[get_updated_devices, get_artifact, configure_device],
+    workflows=[ProposedChangeWorkflow, PortkeyWorkflow, ConfigureDevice],
+    activities=[get_updated_devices, get_artifact, configure_device, get_device],
     max_concurrent_activities=20,
     max_concurrent_workflow_tasks=20,
 )
 
 
-async def run_deployment_workflow(payload: dict[str, Any]) -> WorkflowHandle:
+async def run_proposed_change_workflow(payload: dict[str, Any]) -> WorkflowHandle:
     client = await Client.connect(TEMPORAL_SERVER, namespace="default")
 
     # Use a unique ID for each workflow execution to allow concurrent runs.
     workflow_id = f"proposed-change-{payload['data']['proposed_change_id']}"
     return await client.start_workflow(
-        workflow=Deployment.run,
+        workflow=ProposedChangeWorkflow.run,
+        arg=payload,
+        # start_delay=timedelta(seconds=10),
+        id=workflow_id,
+        task_queue="default_queue",
+    )
+
+
+async def run_portkey_workflow(payload: dict[str, Any]) -> WorkflowHandle:
+    client = await Client.connect(TEMPORAL_SERVER, namespace="default")
+
+    # Use a unique ID for each workflow execution to allow concurrent runs.
+    workflow_id = f"portkey-{payload['data']['target_id']}"
+    return await client.start_workflow(
+        workflow=PortkeyWorkflow.run,
         arg=payload,
         # start_delay=timedelta(seconds=10),
         id=workflow_id,
@@ -260,9 +300,18 @@ fastapi_app = FastAPI(docs_url="/doc")
 app.add_asgi_worker("asgi_worker", fastapi_app, "0.0.0.0", 8001)
 
 
-@fastapi_app.post("/deployment_workflow")
-async def deployment_workflow(payload: dict[str, Any]) -> str:
-    handle = await run_deployment_workflow(payload)
+@fastapi_app.post("/proposed_change_workflow")
+async def proposed_change_workflow(payload: dict[str, Any]) -> str:
+    handle = await run_proposed_change_workflow(payload)
+    return f"Workflow {handle.id} started."
+
+
+@fastapi_app.post("/portkey_workflow")
+async def portkey_workflow(payload: dict[str, Any]) -> str:
+    if payload["data"]["storage_id"] in DEPLOYED_STORAGE_IDS:
+        return "Already deployed this one"
+
+    handle = await run_portkey_workflow(payload)
     return f"Workflow {handle.id} started."
 
 
