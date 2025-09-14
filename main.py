@@ -13,6 +13,7 @@ from temporalio import activity, workflow
 from temporalio.client import Client, WorkflowHandle
 
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger()
 TEMPORAL_SERVER = "temporal:7233"
 DEPLOYED_STORAGE_IDS = set()
 
@@ -23,7 +24,7 @@ app = BoostApp(
     use_pydantic=True,
 )
 
-client = InfrahubClientSync(config=Config(address="http://infrahub-server-1:8000"))
+client = InfrahubClientSync(config=Config(address="http://host.docker.internal:8000"))
 
 all_artifacts_query = """
 query ArtifactQuery {
@@ -39,6 +40,7 @@ CoreArtifact {
         object {
             node {
             display_label
+            id
             }
         }
         }
@@ -90,28 +92,30 @@ InfraDevice(ids: $device_id) {
 
 
 @activity.defn(name="get_updated_devices")
-async def get_updated_devices(branch: str) -> dict[str, tuple[str, str]]:
+async def get_updated_devices(branch: str) -> dict[str, str]:
     data_from_branch = client.execute_graphql(query=all_artifacts_query, branch_name=branch)
     data_from_main = client.execute_graphql(query=all_artifacts_query)
-    devices: dict[str, str] = []
+    devices: dict[tuple[str, str], str] = {}
 
-    branch_artifacts: set[tuple[str, str, str]] = {
+    branch_artifacts: set[tuple[str, str, str, str]] = {
         (
-            artifact["node"]["object"]["node"]["display_label"],
+            artifact["node"]["object"]["node"]["id"],
             artifact["node"]["checksum"]["value"],
+            artifact["node"]["object"]["node"]["display_label"],
             artifact["node"]["storage_id"]["value"],
         )
         for artifact in data_from_branch["CoreArtifact"]["edges"]
     }
-    main_artifacts: set[tuple[str, str, str]] = {
+    main_artifacts: set[tuple[str, str, str, str]] = {
         (
-            artifact["node"]["object"]["node"]["display_label"],
+            artifact["node"]["object"]["node"]["id"],
             artifact["node"]["checksum"]["value"],
+            artifact["node"]["object"]["node"]["display_label"],
             artifact["node"]["storage_id"]["value"],
         )
         for artifact in data_from_main["CoreArtifact"]["edges"]
     }
-    devices = {artifact[0]: (artifact[1], artifact[2]) for artifact in branch_artifacts.difference(main_artifacts)}
+    devices = {(artifact[0], artifact[1]): artifact[2] for artifact in branch_artifacts.difference(main_artifacts)}
 
     return devices
 
@@ -190,6 +194,10 @@ async def configure_device(device: str, artifact: dict[str, Any]) -> dict[str, d
 
 @workflow.defn(sandboxed=False, name="ProposedChangeWorkflow")
 class ProposedChangeWorkflow:
+    def __init__(self) -> None:
+        self.generated_artifacts: set[str] = set()
+        self.received_signals = []
+
     @workflow.run
     async def run(self, payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
         from temporalio.workflow import asyncio
@@ -201,9 +209,11 @@ class ProposedChangeWorkflow:
             start_to_close_timeout=timedelta(seconds=60),
         )
 
+        await workflow.wait_condition(lambda: set(devices.keys()).issubset(self.generated_artifacts))
+
         child_promises = []
-        for device, (expected_checksum, storage_id) in devices.items():
-            DEPLOYED_STORAGE_IDS.add(storage_id)
+        for target_checksum, device in devices.items():
+            expected_checksum = target_checksum.split(",")[1]
             child_promises.append(
                 workflow.execute_child_workflow(
                     workflow=ConfigureDevice.run,
@@ -215,6 +225,11 @@ class ProposedChangeWorkflow:
         results = await asyncio.gather(*child_promises)
         workflow.logger.info("Child workflows finished. Results: %s", results)
         return results
+
+    @workflow.signal
+    async def update_generated_artifacts(self, target_id: str, checksum: str) -> None:
+        self.generated_artifacts.add(f"{target_id},{checksum}")
+        self.received_signals.append(f"Added generated artifacts: {target_id=}, {checksum=}")
 
 
 @workflow.defn(sandboxed=False, name="PortkeyWorkflow")
@@ -296,6 +311,30 @@ async def run_portkey_workflow(payload: dict[str, Any]) -> WorkflowHandle:
     )
 
 
+async def signal_running_workflows(payload: dict[str, Any]) -> WorkflowHandle:
+    client = await Client.connect(TEMPORAL_SERVER, namespace="default")
+
+    query = "WorkflowType = 'ProposedChangeWorkflow' AND ExecutionStatus = 'Running'"
+    running_workflow_ids = []
+
+    async for workflow_execution_description in client.list_workflows(query):
+        logger.info(
+            f"Found running workflow: ID='{workflow_execution_description.id}', RunID='{workflow_execution_description.run_id}'"
+        )
+        running_workflow_ids.append(workflow_execution_description.id)
+
+    if not running_workflow_ids:
+        logger.info("No running ProposedChangeWorkflows found.")
+        return
+
+    for workflow_id in running_workflow_ids:
+        workflow_handle = client.get_workflow_handle(workflow_id=workflow_id)
+        await workflow_handle.signal(
+            signal=ProposedChangeWorkflow.update_generated_artifacts,
+            args=[payload["data"]["target_id"], payload["data"]["checksum"]],
+        )
+
+
 fastapi_app = FastAPI(docs_url="/doc")
 app.add_asgi_worker("asgi_worker", fastapi_app, "0.0.0.0", 8001)
 
@@ -308,11 +347,14 @@ async def proposed_change_workflow(payload: dict[str, Any]) -> str:
 
 @fastapi_app.post("/portkey_workflow")
 async def portkey_workflow(payload: dict[str, Any]) -> str:
-    if payload["data"]["storage_id"] in DEPLOYED_STORAGE_IDS:
-        return "Already deployed this one"
-
     handle = await run_portkey_workflow(payload)
     return f"Workflow {handle.id} started."
+
+
+@fastapi_app.post("/artifact_updated")
+async def artifact_updated(payload: dict[str, Any]) -> str:
+    await signal_running_workflows(payload)
+    return "Signalled all running workflows"
 
 
 if __name__ == "__main__":

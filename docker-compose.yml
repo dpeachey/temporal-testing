@@ -5,9 +5,9 @@ services:
     ports:
       - 8001:8001
     networks:
-      - infrahub_default
+      - nauto
 
 networks:
-  infrahub_default:
+  nauto:
     external: true
-    name: infrahub_default
+    name: nauto
