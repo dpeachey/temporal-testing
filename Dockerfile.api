@@ -12,4 +12,4 @@ COPY . .
 
 # Command to run the application using uv
 # This command is executed when the container starts
-CMD ["uv", "run", "main.py", "run", "all"]
+CMD ["uv", "run", "api.py", "run", "all"]
